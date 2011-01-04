@@ -1,0 +1,5 @@
+; $Id$
+name = SMS to IM
+description = Chat with IM friends
+package = SMS Applications
+core = 6.x

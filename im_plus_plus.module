@@ -1,0 +1,436 @@
+<?php
+
+/**
+ * @file
+ * Provides an SMS to IM integration.
+ *
+ * This module provides functionality connect IM
+ * by SMS
+ * By Heshan Wanigasooriya <heshan@heidisoft.com>
+ */
+define('ONLINE', 1);
+define('OFFLINE', 5);
+define('AWAY', 10);
+define('QUEUE', 20);
+
+/**
+ * Implementation of hook_menu().
+ */
+function im_plus_plus_menu() {
+  $items = array();
+  $items['im'] = array(
+    'page callback' => 'im_plus_plus_receive_sms',
+    'access arguments' => array('access content'),
+  );
+
+  return $items;
+}
+
+function im_plus_plus_receive_sms() {
+  // include required libraries
+  module_load_include('php', 'im_plus_plus', 'library/AppZoneSender');
+  module_load_include('php', 'im_plus_plus', 'library/AppZoneReciever');
+
+  try {
+    //create the receiver
+    $reciever = new AppZoneReciever();
+    //receiving the message content
+    $message = $reciever->getMessage();
+    $address = trim($reciever->getAddress());
+    $corellator = $reciever->getCorrelator();
+    watchdog('IM++', 'Received from !sender with <em>!message </em>', array('!sender' => $address, '!message' => $message, '!correlator' => $corellator), WATCHDOG_DEBUG);
+    // load the user object
+    $user = load_user_object($address);
+    $message_body = explode(' ', $message);
+    // allow only certain commands
+    $codes = array('IM', 'REG');
+    // get the secount element eg : APPID ACTION DATA DATA
+    $command = isset($message_body[1]) ? strtoupper($message_body[1]) : '';
+    if (!in_array(strtoupper($message_body[0]), $codes) || strlen($command) == 0) {
+      _im_plus_plus_send_outgoing_sms($user, 'wrong_format_help');
+      return;
+    }
+    switch ($command) {
+      // Register to IM
+      case 'IM':
+        _im_plus_plus_send_outgoing_sms($user, 'register');
+        break;
+      // Login to  IM
+      case 'LOGIN':
+      case 'L':
+        $im = isset($message_body[2]) ? trim($message_body[2]) : '';
+        if (in_array($im, array('fb', 'gt'))) {
+          $username = isset($message_body[3]) ? trim($message_body[3]) : '';
+          $data = isset($message_body[4]) ? trim($message_body[4]) : '';
+          im_plus_plus_login($user, $username, $data, $im);
+        } else {
+          _im_plus_plus_send_outgoing_sms($user, 'login_help');
+        }
+
+        break;
+      // logout from IM
+      case 'LOGOUT':
+      case 'LO':
+        im_plus_plus_logout_user($user);
+        watchdog('IM++', 'Logout from IM from <em>!address</em>', array('!address' => $user->address), WATCHDOG_DEBUG);
+        break;
+      // set status
+      case 'STATUS':
+        unset($message_body[0]);
+        unset($message_body[1]);
+        $status = trim(implode(' ', $message_body));
+        im_plus_plus_set_status($user, $status);
+        watchdog('IM++', 'Change status from <em>!address</em>', array('!address' => $user->address), WATCHDOG_DEBUG);
+        break;
+      // search online contact list
+      case 'SEARCH':
+      case 'S':
+        watchdog('IM++', 'Search users from <em>!address</em>', array('!address' => $user->address), WATCHDOG_DEBUG);
+        unset($message_body[0]);
+        unset($message_body[1]);
+        $keyword = trim(implode(' ', $message_body));
+        if (empty($keyword)) {
+          _im_plus_plus_send_outgoing_sms($user, 'search_min_keyword');
+        }
+        else
+          im_plus_plus_search_user($user, $keyword);
+        break;
+      // get help
+      case 'HELP':
+      case 'H':
+        _im_plus_plus_send_outgoing_sms($user, 'help');
+//        watchdog('IM++', 'Help request from <em>!address</em>', array('!address' => $user->address), WATCHDOG_DEBUG);
+        break;
+      // get abount
+      case 'ABOUT':
+        _im_plus_plus_send_outgoing_sms($user, 'about');
+//        watchdog('IM++', 'Help request from <em>!address</em>', array('!address' => $user->address), WATCHDOG_DEBUG);
+        break;
+      // ongoing game
+      default :
+        $to = isset($message_body[1]) ? trim($message_body[1]) : '';
+        unset($message_body[0]);
+        unset($message_body[1]);
+        $message = trim(implode(' ', $message_body));
+        if (empty($to) || empty($message)) {
+          _im_plus_plus_send_outgoing_sms($user, 'login_help');
+        } else {
+          im_plus_plus_send_im($user, $to, $message);
+          watchdog('IM++', 'Sending out the message from <em>!address</em>', array('!address' => $user->address), WATCHDOG_DEBUG);
+        }
+        break;
+    }
+  } catch (AppZoneException $ex) {
+    //throws when failed sending or receiving the sms
+    watchdog('IM++', 'SMS receiving failed and throwing !code and !message', array('!message' => $ex->getStatusMessage(), '!code' => $ex->getStatusCode()), WATCHDOG_ERROR);
+  }
+}
+
+/**
+ * Load the user object from the user identification key
+ * @param <type> $address
+ * @return <type>
+ */
+function load_user_object($address) {
+  $user = db_fetch_object(db_query("SELECT uid, address, email, data, timestamp, status, service FROM {im_plus_plus_user} WHERE address = '%s'", $address));
+  if (empty($user)) {
+    // Register this new user.
+    $userinfo = array(
+      'name' => $address,
+      'pass' => user_password(),
+      'init' => $address,
+      'status' => 1,
+      'access' => time()
+    );
+    $account = user_save('', $userinfo);
+    // create new user
+    db_query("INSERT INTO {im_plus_plus_user} (uid, address, status, timestamp) VALUES (%d, '%s', %d, '%s')", $account->uid, $address, OFFLINE, time());
+//    $uid = db_last_insert_id('im_plus_plus_user', 'uid');
+    $user = db_fetch_object(db_query("SELECT uid, address, email, data, timestamp, status, service FROM {im_plus_plus_user} WHERE uid = %d", $account->uid));
+    watchdog('IM++', 'Inserting new user !username', array('!username' => $address), WATCHDOG_INFO);
+  }
+  // check if user not online or timeout user online status(we wil keep user onlin for 5min)
+  elseif (($user->status != ONLINE && !empty($user->email)) || (($user->timestamp + 300) < time())) {
+    db_query("UPDATE {im_plus_plus_user} SET status = %d WHERE uid = %d", QUEUE, $user->uid);
+    watchdog('IM++', 'Add !username to online queue', array('!username' => $address), WATCHDOG_DEBUG);
+  }
+
+  return $user;
+}
+
+/**
+ * Start the contact script and session start
+ * @param <object> $user
+ * @param <string> $username
+ * @param <string> $data
+ * @return <bool> false|true
+ */
+function im_plus_plus_login($user, $username, $data, $im) {
+  // validate email address
+  $username = im_plus_plus_validate_email($username);
+  // check user exists
+  if (!empty($user) && $user->status == ONLINE) {
+    watchdog('IM++', 'user !username already online', array('!username' => $user->email), WATCHDOG_DEBUG);
+    _im_plus_plus_send_outgoing_sms($user, 'user_already_online');
+    return;
+  }
+  // if user email/data is not exits
+  if ((empty($user->email) || empty($user->data)) && (!empty($username) && !empty($data))) {
+    db_query("UPDATE {im_plus_plus_user} SET email = '%s', data = '%s', status = %d, service = '%s' WHERE uid = %d", $username, base64_encode($data), OFFLINE, $im, $user->uid);
+    $user = db_fetch_object(db_query("SELECT uid, email, address, data, service FROM {im_plus_plus_user} WHERE uid = %d", $user->uid));
+    watchdog('IM++', 'Updating user !username set !email', array('!username' => $username, '!email' => $username), WATCHDOG_DEBUG);
+  }
+  // if informations are changed
+  elseif ((!empty($username) && !empty($data)) && ($username != $user->email || $data != base64_decode($user->data))) {
+    db_query("UPDATE {im_plus_plus_user} SET email = '%s', data = '%s', status = %d, service = '%s' WHERE uid = %d", $username, base64_encode($data), OFFLINE, $im, $user->uid);
+    $user = db_fetch_object(db_query("SELECT uid, email, address, data, service FROM {im_plus_plus_user} WHERE uid = %d", $user->uid));
+    watchdog('IM++', 'Updating user !username', array('!username' => $username), WATCHDOG_DEBUG);
+  }
+  // if service is changed
+  elseif ($user->service != $im) {
+    db_query("UPDATE {im_plus_plus_user} SET service = '%s' WHERE uid = %d", $im, $user->uid);
+  }
+  // if no user email and data set and not in the reveived SMS
+  elseif ((empty($user->email) || empty($user->data))) {
+    _im_plus_plus_send_outgoing_sms($user, 'login_help');
+    return;
+  }
+
+  // session start for user
+  module_load_include('inc', 'im_plus_plus', 'includes/xmpphp-drupal');
+  $xmpphp = new XMPPHP_Drupal($user);
+  $auth = $xmpphp->login();
+  if ($auth) {
+    watchdog('IM++', 'Auth success for !username', array('!username' => $username), WATCHDOG_INFO);
+    // queue users for online visible
+    db_query("UPDATE {im_plus_plus_user} SET status = %d WHERE uid = %d", QUEUE, $user->uid);
+    _im_plus_plus_send_outgoing_sms($user, 'login_success');
+    db_query('DELETE FROM {im_plus_plus_user_addressbook} WHERE uid = %d', $user->uid);
+  } else {
+    watchdog('IM++', 'Auth failed for !username', array('!username' => $username), WATCHDOG_ERROR);
+    _im_plus_plus_send_outgoing_sms($user, 'login_failed');
+  }
+}
+
+/**
+ * Validate email address
+ * @param <string> $email
+ * @return <bool> TRUE:FALSE
+ */
+function im_plus_plus_validate_email($email) {
+  // remove the @ mark and the domain if exists
+  $email = strtolower($email);
+  $mail = explode('@', $email);
+  return $mail[0];
+  return TRUE;
+  if (filter_var($email, FILTER_VALIDATE_EMAIL)) {
+    return TRUE;
+  }
+  else
+    return FALSE;
+}
+
+/**
+ * Search a user
+ * @param <type> $keyword
+ */
+function im_plus_plus_search_user($user, $keyword) {
+  if ((empty($user->email) || empty($user->data))) {
+    _im_plus_plus_send_outgoing_sms($user, 'login_help');
+    return;
+  }
+  if (strlen($keyword) > 3) {
+    $keyword = strtolower($keyword);
+    // search the database
+    $result = db_query("SELECT id, name, email FROM {im_plus_plus_user_addressbook} WHERE LOWER(email) LIKE '%%%s%%' OR LOWER(name) LIKE '%%%s%%' AND uid = %d", $keyword, $keyword, $user->uid);
+    $count = db_result(db_query("SELECT COUNT(email) FROM {im_plus_plus_user_addressbook} WHERE LOWER(email) LIKE '%%%s%%' OR LOWER(name) LIKE '%%%s%%' AND uid = %d", $keyword, $keyword, $user->uid));
+    if ($count > 0) {
+      $buddy_emails = "(UID) NAME [email]
+        ";
+      while ($buddy = db_fetch_object($result)) {
+        $buddy_emails .= "($buddy->id) $buddy->name [$buddy->email]" . "
+          ";
+        watchdog('IM++', 'Search buddy <em>!found</em> found for !user', array('!user' => $user->email, '!found' => $buddy->email), WATCHDOG_INFO);
+      }
+      $buddy_emails .= ' You can use IM<space><UID><space><MESSAGE> or IM<space><EMAIL><space><MESSAGE>';
+      _im_plus_plus_send_outgoing_sms($user, 'search', array('body' => $buddy_emails));
+    }
+    else
+      _im_plus_plus_send_outgoing_sms($user, 'search_no_online_friends');
+  } else {
+    _im_plus_plus_send_outgoing_sms($user, 'search_min_keyword');
+  }
+}
+
+/**
+ * Send IM message
+ * @param <type> $to
+ * @param <type> $messages
+ */
+function im_plus_plus_send_im($user, $to, $message) {
+  if ((empty($user->email) || empty($user->data))) {
+    _im_plus_plus_send_outgoing_sms($user, 'login_help');
+    return;
+  }
+  $receiver = null;
+  // load user object from UID
+  if (is_numeric($to))
+    $receiver = db_fetch_object(db_query("SELECT email FROM {im_plus_plus_user_addressbook} WHERE id = %d AND uid = %d", trim($to), $user->uid));
+  else if (!filter_var($to, FILTER_VALIDATE_EMAIL)) {
+    $to = strtolower(trim($to));
+    $count = db_result(db_query("SELECT COUNT(email) FROM {im_plus_plus_user_addressbook} WHERE LOWER(email) LIKE '%%%s%%' OR LOWER(name) LIKE '%%%s%%' AND uid = %d", $to, $to, $user->uid));
+    if ($count == 1)
+      $receiver = db_fetch_object(db_query("SELECT email FROM {im_plus_plus_user_addressbook} WHERE LOWER(email) LIKE '%%%s%%' OR LOWER(name) LIKE '%%%s%%' AND uid = %d", $to, $to, $user->uid));
+    else
+      _im_plus_plus_send_outgoing_sms($user, 'no_receiver_found');
+  }
+  else
+    $receiver->email = $to;
+
+  if (empty($receiver)) {
+    _im_plus_plus_send_outgoing_sms($user, 'no_receiver_found');
+    return;
+  }
+
+  module_load_include('inc', 'im_plus_plus', 'includes/xmpphp-drupal');
+  $xmpphp = new XMPPHP_Drupal($user);
+  $email = $receiver->email;
+  $xmpphp->send_im($email, $message);
+}
+
+/**
+ * Change im_plus_plus status
+ * @param <type> $status
+ */
+function im_plus_plus_set_status($user, $status) {
+  if ((empty($user->email) || empty($user->data))) {
+    _im_plus_plus_send_outgoing_sms($user, 'login_help');
+    return;
+  }
+  module_load_include('inc', 'im_plus_plus', 'includes/xmpphp-drupal');
+  $xmpphp = new XMPPHP_Drupal($user);
+  $xmpphp->set_status($status);
+  _im_plus_plus_send_outgoing_sms($user, 'set_status_success');
+}
+
+/**
+ * Send an outgoing SMS
+ * @param <type> $address
+ * @param <type> $message
+ */
+function _im_plus_plus_send_outgoing_sms($user, $template = 'help', $param = array()) {
+  $message = im_plus_plus_sms_templates($template);
+  $message .= ! empty($param['body']) ? $param['body'] : '';
+
+//  watchdog('IM++', 'Outgoing SMS to !address and !message', array('!address' => $user->address, '!message' => $message), WATCHDOG_DEBUG);
+//  return TRUE;
+//    $address = '0772369394';
+  // include required libraries
+  module_load_include('php', 'im_plus_plus', 'library/AppZoneSender');
+//    module_load_include('php', 'im_plus_plus', 'library/AppZoneReciever');
+  //@TODO : add to config
+  try {
+    // creating sender object
+//        $password = md5(123456);
+//    $sender = new AppZoneSender("http://sdp-simulator.appspot.com", "SMS_4794", 123456);
+    $sender = new AppZoneSender("http://204.236.220.126:65182/services/", "PD_ET_I0067", '5f2b632609ebcf926f2be7b2dea03a10');
+    //sending a one message
+    $address = $user->address;
+    watchdog('IM++', 'Outgoing SMS to !address and <em>!message</em>', array('!address' => $address, '!message' => $message), WATCHDOG_INFO);
+    $length = strlen($message);
+    if ($length > 150) {
+      $portions = str_split($message, 150);
+      $count = count($portions);
+      $i = 1;
+      foreach ($portions as $message) {
+        $res = $sender->sms("$i/$count : " . $message, $address);
+        $i++;
+      }
+    } else {
+      $res = $sender->sms($message, $address);
+    }
+//        var_dump( $sender->sms("Message is this", array(78688,'0721683234')));
+    return TRUE;
+  } catch (AppZoneException $ex) {
+    //throws when failed sending or receiving the sms
+    watchdog('IM++', 'SMS sending failed for !address', array('!address' => $address), WATCHDOG_ERROR);
+//        watchdog('IM++', 'SMS sending failed and throwing !message', array('!message' => $ex->getStatusMessage()), WATCHDOG_ERROR);
+    return FALSE;
+  }
+}
+
+/**
+ * Logout from user
+ * @param <object> $user
+ */
+function im_plus_plus_logout_user($user) {
+  module_load_include('inc', 'im_plus_plus', 'includes/xmpphp-drupal');
+  $xmpphp = new XMPPHP_Drupal($user);
+  $xmpphp->logout();
+  db_query("UPDATE {im_plus_plus_user} SET status = %d WHERE uid = %d", OFFLINE, $user->uid);
+  db_query('DELETE FROM {im_plus_plus_user_addressbook} WHERE uid = %d', $user->uid);
+//    db_query('DELETE FROM {im_plus_plus_user} WHERE uid = %d', $user->uid);
+}
+
+/**
+ * Get the SMS template
+ * @param <string> $type
+ */
+function im_plus_plus_sms_templates($type) {
+
+  switch ($type) {
+    case 'register':
+      return 'You have successfully register with our system.
+Send IM<space>LOGIN<spcae><YOUR USERNAME><space><YOUR PASSWORD> to start.';
+      break;
+    case 'wrong_format_help':
+      return ' Wrong SMS format, below are the valid formats.
+Register: REG<space>IM
+Login: IM<space>LOGIN<space><SERVICE><space><USERNAME><space><PASSWORD>, Eg: IM FB LOGIN XXX XXX for Facebook(FB). gTalk(GT)
+Send chat: IM<space><FRIEND USERNAME><space><MESSAGE>
+Search online friends: IM<space>SEARCH<space><FRIEND NAME>
+Logout: IM<space>LOGOUT
+Set status: IM<space>STATUS<space><STATUS UPDATE>';
+      break;
+    case 'help':
+      return 'Register: REG<space>IM
+Login: IM<space>LOGIN<space><SERVICE><space><USERNAME><space><PASSWORD>, Eg: IM FB LOGIN XXX XXX for Facebook(FB). gTalk(GT)
+Send chat: IM<space><FRIEND USERNAME><space><MESSAGE>
+Search online friends: IM<space>SEARCH<space><FRIEND NAME>
+Logout: IM<space>LOGOUT
+Set status: IM<space>STATUS<space><STATUS UPDATE>';
+      break;
+    case 'user_already_online':
+      return 'You are online. Search online users IM<space>SEARCH<space><FRIEND USERNAME>, Send chat IM<space><FRIEND USER NAME><space><MESSAGE>';
+      break;
+    case 'login_failed':
+      return 'Login failed! please check user name and password and re-try.';
+      break;
+    case 'login_success':
+      return 'You have logged in. Search online users IM<space>SEARCH<space><FRIEND USERNAME>, Send chat IM<space><FRIEND USER NAME><space><MESSAGE>';
+      break;
+    case 'search':
+      return '';
+      break;
+    case 'search_no_online_friends':
+      return 'No online friend found, please check the keywords\n and re-try.';
+      break;
+    case 'search_min_keyword':
+      return 'To search online users you should enter more than 3 letters to continue.';
+      break;
+    case 'set_status_success':
+      return 'Status update success!.';
+      break;
+    case 'no_receiver_found':
+      return 'No, chat receiver found for that ID or email. Search online users type IM<space>SEARCH<FRIEND NAME>';
+      break;
+    case 'login_help':
+      return 'You can chat on Facebook(FB) or gTalk(GT) friends. Login
+IM<space>LOGIN<space><SERVICE><space><USERID><space><PASSWORD>
+Eg: for Facebook : IM LOGIN FB xxx xxx';
+      break;
+    case 'about':
+      return 'IM++ is a SMS chat application, you can start chat with online Facebook or GoogleTalk users.';
+      break;
+  }
+}
