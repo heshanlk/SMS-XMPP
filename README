@@ -1,0 +1,8 @@
+Install
+-------
+Copy XMPPHP and other related libs to library folder.
+Install the module.
+Symlink background_script.php and render.php ro root
+Add background script to run in background.
+
+© Copyrights 2011 Heshan Wanigasooriya. All rights reserved.
